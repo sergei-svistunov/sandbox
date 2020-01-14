@@ -1,0 +1,13 @@
+Source: sandbox
+Section: unknown
+Priority: optional
+Maintainer: Sergei Svistunov <sergei-svistunov@yandex.ru>
+Build-Depends: debhelper (>= 10)
+Standards-Version: 4.1.2
+#Vcs-Git: https://anonscm.debian.org/git/collab-maint/sandbox.git
+#Vcs-Browser: https://anonscm.debian.org/cgit/collab-maint/sandbox.git
+
+Package: sandbox
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: A simple tool for running soft in isolated containers.
