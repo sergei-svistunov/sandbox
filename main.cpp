@@ -5,26 +5,30 @@
 #include <regex>
 #include <cstdlib>
 
-#include <boost/filesystem.hpp>
-
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
+#include <mntent.h>
 
+#include <boost/filesystem.hpp>
 #include <libcgroup.h>
 
-#define STACK_SIZE 1024 * 1024
+#define STACK_SIZE (1024 * 1024)
 #define NOBODY_UID 65534
 
 namespace fs = boost::filesystem;
 namespace bs = boost::system;
 
 struct exe_opts {
-    const fs::path &sandbox;
     const fs::path &bin_path;
     const std::vector<char *> &args;
     const std::vector<char *> &env;
 };
+
+static pid_t pid;
+static fs::path sandbox = {};
+static cgroup *sandbox_cgroup = nullptr;
 
 void fatal(const std::string &message) {
     std::cerr << message << std::endl;
@@ -50,6 +54,9 @@ void init_dirs(const fs::path &sandbox) {
         if (ec.value() != bs::errc::success)
             fatal("cannot create system dir: " + ec.message());
     }
+
+    if (chmod((sandbox / "tmp").c_str(), 0777))
+        fatal_errno("cannot set mode 777 for /tmp");
 }
 
 void libs_deps(fs::path &bin, std::vector<std::string> &res) {
@@ -76,7 +83,7 @@ void libs_deps(fs::path &bin, std::vector<std::string> &res) {
     }
 }
 
-void add_file(const fs::path &sandbox, const fs::path &src, const fs::path &dst, bool with_deps) {
+void add_file(const fs::path &src, const fs::path &dst, bool with_deps) {
     auto sbox_path = sandbox / dst;
 
     bs::error_code ec;
@@ -118,14 +125,30 @@ void add_file(const fs::path &sandbox, const fs::path &src, const fs::path &dst,
     }
 }
 
+void mount_dir(const fs::path &src, const fs::path &dst) {
+    auto sbox_path = sandbox / dst;
+
+    bs::error_code ec;
+    fs::create_directories(sbox_path, ec);
+    if (ec.value() != bs::errc::success)
+        fatal("cannot create target mount directory: " + ec.message());
+
+    if (mount(src.c_str(), sbox_path.c_str(), "", MS_BIND, nullptr))
+        if (errno != EBUSY)
+            fatal_errno("cannot mount dir " + src.string());
+}
+
 cgroup *create_cgroup(const std::string &name, uint64_t mem_limit) {
     if (cgroup_init())
         fatal_cgroup("cannot init cgroup");
 
     auto cgroup = cgroup_new_cgroup(name.c_str());
 
+    auto mem_ctrl = cgroup_add_controller(cgroup, "memory");
+    auto cpuacct_ctrl = cgroup_add_controller(cgroup, "cpuacct");
+    auto blkio_ctrl = cgroup_add_controller(cgroup, "blkio");
+
     if (mem_limit) {
-        auto mem_ctrl = cgroup_add_controller(cgroup, "memory");
         if (cgroup_set_value_uint64(mem_ctrl, "memory.limit_in_bytes", mem_limit))
             fatal_cgroup("cannot set memory limit");
     }
@@ -139,7 +162,7 @@ cgroup *create_cgroup(const std::string &name, uint64_t mem_limit) {
 static int _execute(void *arg) {
     auto *opts = static_cast<exe_opts *>(arg);
 
-    if (chroot(opts->sandbox.c_str()))
+    if (chroot(sandbox.c_str()))
         fatal_errno("cannot chroot");
 
     if (mount("udev", "/dev", "devtmpfs", 0, nullptr))
@@ -165,18 +188,44 @@ static int _execute(void *arg) {
     return EXIT_SUCCESS;
 }
 
-void execute(const fs::path &sandbox, const fs::path &bin, const std::vector<char *> &args,
-             const std::vector<char *> &env, const std::string &cgroup_name, const uint64_t mem_limit) {
+void clean() {
+    if (sandbox_cgroup != nullptr) {
+        if (cgroup_delete_cgroup(sandbox_cgroup, 0))
+            fatal_cgroup("cannot delete cgroup");
+
+        cgroup_free(&sandbox_cgroup);
+    }
+
+    if (sandbox.empty())
+        return;
+
+    auto mounts_f = setmntent("/proc/mounts", "r");
+    while (auto mounts = getmntent(mounts_f)) {
+        if (std::string(mounts->mnt_dir).find(sandbox.string()) != 0)
+            continue;
+
+        if (umount2(mounts->mnt_dir, MNT_FORCE))
+            fatal_errno(std::string("cannot umount ") + mounts->mnt_dir);
+    }
+    endmntent(mounts_f);
+
+    bs::error_code ec;
+    fs::remove_all(sandbox, ec);
+    if (ec.value() != bs::errc::success)
+        fatal("cannot remove sandbox: " + ec.message());
+}
+
+void execute(const fs::path &bin, const std::vector<char *> &args, const std::vector<char *> &env,
+             const int flags, const std::string &cgroup_name, const uint64_t mem_limit) {
 
     if (mem_limit && cgroup_name.empty())
         fatal("cannot set memory limit without cgroup name");
 
-    exe_opts opts{sandbox, bin, args, env};
+    exe_opts opts{bin, args, env};
 
-    cgroup *cgroup = nullptr;
     if (!cgroup_name.empty()) {
-        cgroup = create_cgroup(cgroup_name, mem_limit);
-        if (cgroup_attach_task(cgroup))
+        sandbox_cgroup = create_cgroup(cgroup_name, mem_limit);
+        if (cgroup_attach_task(sandbox_cgroup))
             fatal_cgroup("cannot attach process to cgroup");
     }
 
@@ -187,30 +236,14 @@ void execute(const fs::path &sandbox, const fs::path &bin, const std::vector<cha
 
     stackTop = stack + STACK_SIZE;
 
-    auto pid = clone(_execute, stackTop,
-                     CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWNET | SIGCHLD, &opts);
+    pid = clone(_execute, stackTop, flags, &opts);
     if (pid == -1)
         fatal("cannot clone");
 
     waitpid(pid, nullptr, 0);
+    std::cerr << getpid() << " WAITPID " << pid << "\n";
 
-    if (cgroup != nullptr) {
-        if (cgroup_delete_cgroup(cgroup, 0))
-            fatal_cgroup("cannot delete cgroup");
-
-        cgroup_free(&cgroup);
-    }
-
-    if (umount2((sandbox / "/dev").c_str(), MNT_FORCE))
-        fatal_errno("cannot umount /dev");
-
-    if (umount2((sandbox / "/proc").c_str(), MNT_FORCE))
-        fatal_errno("cannot umount /proc");
-
-    bs::error_code ec;
-    fs::remove_all(sandbox, ec);
-    if (ec.value() != bs::errc::success)
-        fatal("cannot remove sanbox: " + ec.message());
+    clean();
 }
 
 void print_usage() {
@@ -218,22 +251,37 @@ void print_usage() {
     sandbox <sandbox path> [args] -- <cmd to execute> [cmd args]
 args:
     --add_file <src host path> <dst sandbox path>
-        Copy file from host system to sandbox
+        Copy a file from a host system to a sandbox
 
     --add_elf_file <src host path> <dst sandbox path>
-        Copy ELF file from host system to sandbox with needed libraries
+        Copy an ELF file from a host system to a sandbox with needed libraries
+
+    --mount_dir <src host path> <dst sandbox path>
+        Mount a directory from a host system to a sandbox
 
     --env <value>
         Environ variables
 
+    --no_new_net
+        Do not isolate network
+
     --cgroup <name>
-        Run process in cgroup1
+        Run a process in a cgroup
 
     --mem_limit 0
-        Limit memory for process
+        Limit memory for a process
 )" << std::endl;
 
     exit(EXIT_FAILURE);
+}
+
+void signalHandler(int signum) {
+    kill(pid, signum);
+    waitpid(pid, nullptr, 0);
+
+    clean();
+
+    exit(EXIT_SUCCESS);
 }
 
 int main(int argc, char *argv[]) {
@@ -243,7 +291,7 @@ int main(int argc, char *argv[]) {
     if (argc < 2 || strncmp(argv[1], "--", 2) == 0)
         print_usage();
 
-    fs::path sandbox = argv[1];
+    sandbox = argv[1];
     init_dirs(sandbox);
 
     fs::path cmd;
@@ -251,6 +299,7 @@ int main(int argc, char *argv[]) {
     uint64_t mem_limit = 0;
     std::vector<char *> cmd_args = {nullptr}; // reserved for cmd path
     std::vector<char *> cmd_env;
+    int ignored_flags = 0;
 
     auto i = 2;
     while (i < argc) {
@@ -267,7 +316,15 @@ int main(int argc, char *argv[]) {
             if (i + 3 > argc || strncmp(argv[i + 1], "--", 2) == 0 || strncmp(argv[i + 2], "--", 2) == 0)
                 print_usage();
 
-            add_file(sandbox, argv[i + 1], argv[i + 2], strcmp(argv[i], "--add_elf_file") == 0);
+            add_file(argv[i + 1], argv[i + 2], strcmp(argv[i], "--add_elf_file") == 0);
+
+            i += 3;
+
+        } else if (strcmp(argv[i], "--mount_dir") == 0) {
+            if (i + 3 > argc || strncmp(argv[i + 1], "--", 2) == 0 || strncmp(argv[i + 2], "--", 2) == 0)
+                print_usage();
+
+            mount_dir(argv[i + 1], argv[i + 2]);
 
             i += 3;
 
@@ -278,6 +335,12 @@ int main(int argc, char *argv[]) {
             cmd_env.push_back(argv[i + 1]);
 
             i += 2;
+
+        } else if (strcmp(argv[i], "--no_new_net") == 0) {
+            ignored_flags |= CLONE_NEWNET;
+
+            i++;
+
         } else if (strcmp(argv[i], "--cgroup") == 0) {
             if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
                 print_usage();
@@ -299,11 +362,17 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    int flags = CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWCGROUP | SIGCHLD;
+    if ((ignored_flags & CLONE_NEWNET) == 0)
+        flags |= CLONE_NEWNET;
+
     cmd_args[0] = const_cast<char *>(cmd.c_str());
     cmd_args.push_back(nullptr);
     cmd_env.push_back(nullptr);
 
-    execute(sandbox, cmd, cmd_args, cmd_env, cgroup, mem_limit);
+    signal(SIGINT, signalHandler);
+
+    execute(cmd, cmd_args, cmd_env, flags, cgroup, mem_limit);
 
     return EXIT_SUCCESS;
 }
