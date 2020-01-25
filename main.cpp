@@ -241,7 +241,6 @@ void execute(const fs::path &bin, const std::vector<char *> &args, const std::ve
         fatal("cannot clone");
 
     waitpid(pid, nullptr, 0);
-    std::cerr << getpid() << " WAITPID " << pid << "\n";
 
     clean();
 }
