@@ -83,44 +83,53 @@ void libs_deps(fs::path &bin, std::vector<std::string> &res) {
     }
 }
 
+void create_hardlink(const fs::path &src, const fs::path &dst) {
+    bs::error_code ec;
+
+    fs::path real_path = src;
+    if (fs::is_symlink(src)) {
+        auto target = fs::read_symlink(src, ec);
+        if (ec.value() != bs::errc::success)
+            fatal("cannot read symlink shared link: " + ec.message());
+
+        if (target.has_root_path())
+            real_path = target;
+        else
+            real_path = fs::path(src).parent_path() / target;
+    }
+
+    fs::create_directories(dst.parent_path(), ec);
+    if (ec.value() != bs::errc::success)
+        fatal("cannot create directory for hard link: " + ec.message());
+
+    fs::create_hard_link(real_path, dst, ec);
+    if (ec != bs::errc::success) {
+        if (ec == bs::errc::file_exists)
+            return;
+
+        if (ec == bs::errc::cross_device_link) {
+            fs::copy_file(real_path, dst, ec);
+            if (ec != bs::errc::success) {
+                fatal("cannot copy cross-device file: " + ec.message());
+            }
+            return;
+        }
+
+        fatal("cannot create hardlink: " + ec.message());
+    }
+}
+
 void add_file(const fs::path &src, const fs::path &dst, bool with_deps) {
     auto sbox_path = sandbox / dst;
 
-    bs::error_code ec;
-
-    fs::create_directories(sbox_path.parent_path(), ec);
-    if (ec.value() != bs::errc::success)
-        fatal("cannot create adding file directory: " + ec.message());
-
-    fs::create_hard_link(src, sbox_path, ec);
-    if (ec != bs::errc::success && ec != bs::errc::file_exists)
-        fatal("cannot create adding file hardlink: " + ec.message());
+    create_hardlink(src, sbox_path);
 
     if (with_deps) {
         std::vector<std::string> libs;
         libs_deps(sbox_path, libs);
 
         for (auto &l:libs) {
-            auto sbox_lib = sandbox / l;
-            fs::create_directories(sbox_lib.parent_path(), ec);
-            if (ec.value() != bs::errc::success)
-                fatal("cannot create directory for shared link: " + ec.message());
-
-            fs::path real_path = l;
-            if (fs::is_symlink(l)) {
-                auto target = fs::read_symlink(l, ec);
-                if (ec.value() != bs::errc::success)
-                    fatal("cannot read symlink shared link: " + ec.message());
-
-                if (target.has_root_path())
-                    real_path = target;
-                else
-                    real_path = fs::path(l).parent_path() / target;
-            }
-
-            fs::create_hard_link(real_path, sbox_lib, ec);
-            if (ec != bs::errc::success && ec != bs::errc::file_exists)
-                fatal("cannot create hardlink for shared library: " + ec.message());
+            create_hardlink(l, sandbox / l);
         }
     }
 }
