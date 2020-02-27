@@ -142,6 +142,17 @@ void mount_dir(const fs::path &src, const fs::path &dst) {
     if (ec.value() != bs::errc::success)
         fatal("cannot create target mount directory: " + ec.message());
 
+    // Remove all exists dir mounts
+    auto mounts_f = setmntent("/proc/mounts", "r");
+    while (auto mounts = getmntent(mounts_f)) {
+        if (mounts->mnt_dir != sbox_path)
+            continue;
+
+        if (umount2(mounts->mnt_dir, MNT_FORCE))
+            fatal_errno(std::string("cannot umount ") + mounts->mnt_dir);
+    }
+    endmntent(mounts_f);
+
     if (mount(src.c_str(), sbox_path.c_str(), "", MS_BIND, nullptr))
         if (errno != EBUSY)
             fatal_errno("cannot mount dir " + src.string());
