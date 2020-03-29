@@ -45,7 +45,76 @@ void fatal_cgroup(const std::string &message) {
     exit(EXIT_FAILURE);
 }
 
+void path_pids(fs::path &path, std::vector<int> &res) {
+    std::array<char, 256> buffer{};
+
+    std::string out_buf;
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(
+            (std::string("/usr/bin/lsof -n -Fp +d ") + path.string()).c_str(), "r"), pclose);
+    if (!pipe) {
+        fatal("cannot get path pids");
+    }
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+        out_buf += buffer.data();
+    }
+
+    std::regex e(R"(p([\d]+))");
+    std::smatch m;
+
+    while (std::regex_search(out_buf, m, e)) {
+        if (m.length() < 2)
+            continue;
+
+        res.push_back(std::strtol(m[1].first.base(), nullptr, 10));
+
+        out_buf = m.suffix().str();
+    }
+}
+
+void clean() {
+    // Remove cgroups
+    if (sandbox_cgroup != nullptr) {
+        if (cgroup_delete_cgroup(sandbox_cgroup, 0))
+            fatal_cgroup("cannot delete cgroup");
+
+        cgroup_free(&sandbox_cgroup);
+    }
+
+    if (sandbox.empty())
+        return;
+
+    if (!fs::exists(sandbox)) { ;
+        return;
+    }
+
+    // Kill all processes that use the path
+    std::vector<int> pids;
+    path_pids(sandbox, pids);
+    for (auto p: pids) {
+        kill(p, SIGKILL);
+        waitpid(p, nullptr, 0);
+    }
+
+    // Remove path
+    auto mounts_f = setmntent("/proc/mounts", "r");
+    while (auto mounts = getmntent(mounts_f)) {
+        if (std::string(mounts->mnt_dir).find(sandbox.string()) != 0)
+            continue;
+
+        if (umount2(mounts->mnt_dir, MNT_FORCE))
+            fatal_errno(std::string("cannot umount ") + mounts->mnt_dir);
+    }
+    endmntent(mounts_f);
+
+    bs::error_code ec;
+    fs::remove_all(sandbox, ec);
+    if (ec.value() != bs::errc::success)
+        fatal("cannot remove sandbox: " + ec.message());
+}
+
 void init_dirs(const fs::path &sandbox) {
+    clean();
+
     std::array<std::string, 5> dirs = {"dev", "etc", "proc", "root", "tmp"};
 
     bs::error_code ec;
@@ -142,17 +211,6 @@ void mount_dir(const fs::path &src, const fs::path &dst) {
     if (ec.value() != bs::errc::success)
         fatal("cannot create target mount directory: " + ec.message());
 
-    // Remove all exists dir mounts
-    auto mounts_f = setmntent("/proc/mounts", "r");
-    while (auto mounts = getmntent(mounts_f)) {
-        if (mounts->mnt_dir != sbox_path)
-            continue;
-
-        if (umount2(mounts->mnt_dir, MNT_FORCE))
-            fatal_errno(std::string("cannot umount ") + mounts->mnt_dir);
-    }
-    endmntent(mounts_f);
-
     if (mount(src.c_str(), sbox_path.c_str(), "", MS_BIND, nullptr))
         if (errno != EBUSY)
             fatal_errno("cannot mount dir " + src.string());
@@ -206,33 +264,6 @@ static int _execute(void *arg) {
     fatal("cannot run file: " + std::string(strerror(errno)));
 
     return EXIT_SUCCESS;
-}
-
-void clean() {
-    if (sandbox_cgroup != nullptr) {
-        if (cgroup_delete_cgroup(sandbox_cgroup, 0))
-            fatal_cgroup("cannot delete cgroup");
-
-        cgroup_free(&sandbox_cgroup);
-    }
-
-    if (sandbox.empty())
-        return;
-
-    auto mounts_f = setmntent("/proc/mounts", "r");
-    while (auto mounts = getmntent(mounts_f)) {
-        if (std::string(mounts->mnt_dir).find(sandbox.string()) != 0)
-            continue;
-
-        if (umount2(mounts->mnt_dir, MNT_FORCE))
-            fatal_errno(std::string("cannot umount ") + mounts->mnt_dir);
-    }
-    endmntent(mounts_f);
-
-    bs::error_code ec;
-    fs::remove_all(sandbox, ec);
-    if (ec.value() != bs::errc::success)
-        fatal("cannot remove sandbox: " + ec.message());
 }
 
 void execute(const fs::path &bin, const std::vector<char *> &args, const std::vector<char *> &env,
@@ -306,6 +337,9 @@ void signalHandler(int signum) {
 int main(int argc, char *argv[]) {
     if (getuid() != 0 && geteuid() != 0)
         fatal("required root privileges");
+
+    if (setreuid(0, 0))
+        fatal_errno("cannot set reuid");
 
     if (argc < 2 || strncmp(argv[1], "--", 2) == 0)
         print_usage();
