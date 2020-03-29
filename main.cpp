@@ -45,12 +45,16 @@ void fatal_cgroup(const std::string &message) {
     exit(EXIT_FAILURE);
 }
 
-void path_pids(fs::path &path, std::vector<int> &res) {
+void path_pids(std::vector<int> &res) {
+    if (!fs::exists(sandbox)) { ;
+        return;
+    }
+
     std::array<char, 256> buffer{};
 
     std::string out_buf;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(
-            (std::string("/usr/bin/lsof -n -Fp +d ") + path.string()).c_str(), "r"), pclose);
+    auto lsof_cmd = std::string("/usr/bin/lsof -n -w -Fp +d ") + sandbox.string();
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(lsof_cmd.c_str(), "r"), pclose);
     if (!pipe) {
         fatal("cannot get path pids");
     }
@@ -71,28 +75,22 @@ void path_pids(fs::path &path, std::vector<int> &res) {
     }
 }
 
-void clean() {
-    // Remove cgroups
-    if (sandbox_cgroup != nullptr) {
-        if (cgroup_delete_cgroup(sandbox_cgroup, 0))
-            fatal_cgroup("cannot delete cgroup");
-
-        cgroup_free(&sandbox_cgroup);
-    }
-
-    if (sandbox.empty())
-        return;
-
-    if (!fs::exists(sandbox)) { ;
-        return;
-    }
-
+void kill_all_sandbox_processes() {
     // Kill all processes that use the path
     std::vector<int> pids;
-    path_pids(sandbox, pids);
+    path_pids(pids);
     for (auto p: pids) {
+        std::cerr << "Kill pid " << p << std::endl;
         kill(p, SIGKILL);
+    }
+
+    for (auto p: pids)
         waitpid(p, nullptr, 0);
+}
+
+void remove_sandbox_path() {
+    if (!fs::exists(sandbox)) { ;
+        return;
     }
 
     // Remove path
@@ -101,8 +99,20 @@ void clean() {
         if (std::string(mounts->mnt_dir).find(sandbox.string()) != 0)
             continue;
 
-        if (umount2(mounts->mnt_dir, MNT_FORCE))
-            fatal_errno(std::string("cannot umount ") + mounts->mnt_dir);
+        int i = 0;
+        while (++i) {
+            if (umount2(mounts->mnt_dir, MNT_FORCE)) {
+                if (errno == EBUSY) {
+                    if (i % 50 == 0)
+                        std::cerr << "cannot umount: busy, retry" << std::endl;
+
+                    sleep(0);
+                    continue;
+                }
+                fatal_errno(std::string("cannot umount ") + mounts->mnt_dir);
+            }
+            break;
+        }
     }
     endmntent(mounts_f);
 
@@ -112,8 +122,21 @@ void clean() {
         fatal("cannot remove sandbox: " + ec.message());
 }
 
-void init_dirs(const fs::path &sandbox) {
-    clean();
+void clean() {
+    // Remove cgroups
+    if (sandbox_cgroup != nullptr) {
+        if (cgroup_delete_cgroup(sandbox_cgroup, 0))
+            fatal_cgroup("cannot delete cgroup");
+
+        cgroup_free(&sandbox_cgroup);
+    }
+
+    remove_sandbox_path();
+}
+
+void init_dirs() {
+    kill_all_sandbox_processes();
+    remove_sandbox_path();
 
     std::array<std::string, 5> dirs = {"dev", "etc", "proc", "root", "tmp"};
 
@@ -345,7 +368,12 @@ int main(int argc, char *argv[]) {
         print_usage();
 
     sandbox = argv[1];
-    init_dirs(sandbox);
+
+    init_dirs();
+
+    // link sandbox manager process with sandbox path
+    if (!fopen(sandbox.c_str(), "r"))
+        fatal_errno("cannot open sandbox path");
 
     fs::path cmd;
     std::string cgroup;
