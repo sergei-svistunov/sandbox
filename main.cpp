@@ -349,7 +349,7 @@ args:
 }
 
 void signalHandler(int signum) {
-    kill(pid, signum);
+    kill(pid, SIGINT);
     waitpid(pid, nullptr, 0);
 
     clean();
@@ -452,6 +452,7 @@ int main(int argc, char *argv[]) {
     cmd_env.push_back(nullptr);
 
     signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
 
     execute(cmd, cmd_args, cmd_env, flags, cgroup, mem_limit);
 
