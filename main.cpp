@@ -289,8 +289,8 @@ static int _execute(void *arg) {
     return EXIT_SUCCESS;
 }
 
-void execute(const fs::path &bin, const std::vector<char *> &args, const std::vector<char *> &env,
-             const int flags, const std::string &cgroup_name, const uint64_t mem_limit) {
+int execute(const fs::path &bin, const std::vector<char *> &args, const std::vector<char *> &env,
+            const int flags, const std::string &cgroup_name, const uint64_t mem_limit) {
 
     if (mem_limit && cgroup_name.empty())
         fatal("cannot set memory limit without cgroup name");
@@ -314,9 +314,12 @@ void execute(const fs::path &bin, const std::vector<char *> &args, const std::ve
     if (pid == -1)
         fatal("cannot clone");
 
-    waitpid(pid, nullptr, 0);
+    int wstatus;
+    waitpid(pid, &wstatus, 0);
 
     clean();
+
+    return WEXITSTATUS(wstatus);
 }
 
 void print_usage() {
@@ -454,7 +457,5 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
-    execute(cmd, cmd_args, cmd_env, flags, cgroup, mem_limit);
-
-    return EXIT_SUCCESS;
+    return execute(cmd, cmd_args, cmd_env, flags, cgroup, mem_limit);
 }
