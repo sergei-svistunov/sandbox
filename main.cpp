@@ -289,8 +289,38 @@ static int _execute(void *arg) {
     return EXIT_SUCCESS;
 }
 
-int execute(const fs::path &bin, const std::vector<char *> &args, const std::vector<char *> &env,
-            const int flags, const std::string &cgroup_name, const uint64_t mem_limit) {
+void save_usage_stat(const std::string &filename, const std::string &cgroup_name) {
+    fs::ofstream out(filename);
+    if (!out.is_open())
+        fatal_errno("cannot create file for usage statistic");
+
+    fs::ifstream cpu_usage_in(fs::path("/sys/fs/cgroup/cpuacct") / cgroup_name / "cpuacct.usage_all");
+    if (cpu_usage_in.is_open()) {
+        std::string header;
+        cpu_usage_in >> header >> header >> header;
+        uint64_t total_user = 0;
+        uint64_t total_system = 0;
+        while (cpu_usage_in) {
+            uint64_t cpu_id, user, system;
+            cpu_usage_in >> cpu_id >> user >> system;
+            total_user += user;
+            total_system += system;
+        }
+
+        out << "cpu_user\t" << total_user << "\n";
+        out << "cpu_system\t" << total_system << "\n";
+    }
+
+    fs::ifstream memory_usage_in(fs::path("/sys/fs/cgroup/memory") / cgroup_name / "memory.usage_in_bytes");
+    if (memory_usage_in.is_open()) {
+        uint64_t bytes = 0;
+        memory_usage_in >> bytes;
+        out << "memory\t" << bytes << "\n";
+    }
+}
+
+int execute(const fs::path &bin, const std::vector<char *> &args, const std::vector<char *> &env, const int flags,
+            const std::string &cgroup_name, const uint64_t mem_limit, const std::string &usage_stat_file) {
 
     if (mem_limit && cgroup_name.empty())
         fatal("cannot set memory limit without cgroup name");
@@ -316,6 +346,9 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
 
     int wstatus;
     waitpid(pid, &wstatus, 0);
+
+    if (!usage_stat_file.empty())
+        save_usage_stat(usage_stat_file, cgroup_name);
 
     clean();
 
@@ -346,6 +379,9 @@ args:
 
     --mem_limit 0
         Limit memory for a process
+
+    --save_usage_stat <filename>
+        Save usage statistic to file after exit
 )" << std::endl;
 
     exit(EXIT_FAILURE);
@@ -379,7 +415,7 @@ int main(int argc, char *argv[]) {
         fatal_errno("cannot open sandbox path");
 
     fs::path cmd;
-    std::string cgroup;
+    std::string cgroup, usage_stat_file;
     uint64_t mem_limit = 0;
     std::vector<char *> cmd_args = {nullptr}; // reserved for cmd path
     std::vector<char *> cmd_env;
@@ -441,6 +477,14 @@ int main(int argc, char *argv[]) {
 
             i += 2;
 
+        } else if (strcmp(argv[i], "--save_usage_stat") == 0) {
+            if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
+                print_usage();
+
+            usage_stat_file = argv[i + 1];
+
+            i += 2;
+
         } else {
             print_usage();
         }
@@ -457,5 +501,5 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
-    return execute(cmd, cmd_args, cmd_env, flags, cgroup, mem_limit);
+    return execute(cmd, cmd_args, cmd_env, flags, cgroup, mem_limit, usage_stat_file);
 }
