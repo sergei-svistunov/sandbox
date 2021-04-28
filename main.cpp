@@ -250,9 +250,11 @@ cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, uint6
         if (cgroup_set_value_string(cpuset_ctrl, "cpuset.cpus", cpu_set.c_str()))
             fatal_cgroup("cannot set cpuset.cpus");
 
+        if (cgroup_set_value_string(cpuset_ctrl, "cpuset.cpus", cpu_set.c_str()))
+            fatal_cgroup("cannot set cpuset.cpus");
+
         if (cgroup_set_value_string(cpuset_ctrl, "cpuset.mems", "0"))
             fatal_cgroup("cannot set cpuset.mems");
-
     }
 
     if (mem_limit) {
@@ -388,6 +390,9 @@ args:
 
     --cgroup <name>
         Run a process in a cgroup
+
+    --cpuset list
+        Specifies the CPUs that are permitted to access
 
     --mem_limit 0
         Limit memory for a process
