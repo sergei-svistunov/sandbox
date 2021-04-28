@@ -239,20 +239,31 @@ void mount_dir(const fs::path &src, const fs::path &dst) {
             fatal_errno("cannot mount dir " + src.string());
 }
 
-cgroup *create_cgroup(const std::string &name, uint64_t mem_limit) {
+cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, uint64_t mem_limit) {
     if (cgroup_init())
         fatal_cgroup("cannot init cgroup");
 
     auto cgroup = cgroup_new_cgroup(name.c_str());
 
-    auto mem_ctrl = cgroup_add_controller(cgroup, "memory");
-    auto cpuacct_ctrl = cgroup_add_controller(cgroup, "cpuacct");
-    auto blkio_ctrl = cgroup_add_controller(cgroup, "blkio");
+    if (!cpu_set.empty()) {
+        auto cpuset_ctrl = cgroup_add_controller(cgroup, "cpuset");
+        if (cgroup_set_value_string(cpuset_ctrl, "cpuset.cpus", cpu_set.c_str()))
+            fatal_cgroup("cannot set cpuset.cpus");
+
+        if (cgroup_set_value_string(cpuset_ctrl, "cpuset.mems", "0"))
+            fatal_cgroup("cannot set cpuset.mems");
+
+    }
 
     if (mem_limit) {
+        auto mem_ctrl = cgroup_add_controller(cgroup, "memory");
+
         if (cgroup_set_value_uint64(mem_ctrl, "memory.limit_in_bytes", mem_limit))
             fatal_cgroup("cannot set memory limit");
     }
+
+    cgroup_add_controller(cgroup, "cpuacct");
+    cgroup_add_controller(cgroup, "blkio");
 
     if (cgroup_create_cgroup(cgroup, 0))
         fatal_cgroup("cannot create cgroup");
@@ -320,7 +331,8 @@ void save_usage_stat(const std::string &filename, const std::string &cgroup_name
 }
 
 int execute(const fs::path &bin, const std::vector<char *> &args, const std::vector<char *> &env, const int flags,
-            const std::string &cgroup_name, const uint64_t mem_limit, const std::string &usage_stat_file) {
+            const std::string &cgroup_name, const std::string &cpu_set, const uint64_t mem_limit,
+            const std::string &usage_stat_file) {
 
     if (mem_limit && cgroup_name.empty())
         fatal("cannot set memory limit without cgroup name");
@@ -328,7 +340,7 @@ int execute(const fs::path &bin, const std::vector<char *> &args, const std::vec
     exe_opts opts{bin, args, env};
 
     if (!cgroup_name.empty()) {
-        sandbox_cgroup = create_cgroup(cgroup_name, mem_limit);
+        sandbox_cgroup = create_cgroup(cgroup_name, cpu_set, mem_limit);
         if (cgroup_attach_task(sandbox_cgroup))
             fatal_cgroup("cannot attach process to cgroup");
     }
@@ -415,7 +427,7 @@ int main(int argc, char *argv[]) {
         fatal_errno("cannot open sandbox path");
 
     fs::path cmd;
-    std::string cgroup, usage_stat_file;
+    std::string cgroup, cpu_set, usage_stat_file;
     uint64_t mem_limit = 0;
     std::vector<char *> cmd_args = {nullptr}; // reserved for cmd path
     std::vector<char *> cmd_env;
@@ -469,6 +481,14 @@ int main(int argc, char *argv[]) {
 
             i += 2;
 
+        } else if (strcmp(argv[i], "--cpuset") == 0) {
+            if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
+                print_usage();
+
+            cpu_set = argv[i + 1];
+
+            i += 2;
+
         } else if (strcmp(argv[i], "--mem_limit") == 0) {
             if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
                 print_usage();
@@ -501,5 +521,5 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
-    return execute(cmd, cmd_args, cmd_env, flags, cgroup, mem_limit, usage_stat_file);
+    return execute(cmd, cmd_args, cmd_env, flags, cgroup, cpu_set, mem_limit, usage_stat_file);
 }
