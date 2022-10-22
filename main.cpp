@@ -125,9 +125,7 @@ void remove_sandbox_path() {
 void clean() {
     // Remove cgroups
     if (sandbox_cgroup != nullptr) {
-        if (cgroup_delete_cgroup(sandbox_cgroup, 0))
-            fatal_cgroup("cannot delete cgroup");
-
+        cgroup_delete_cgroup(sandbox_cgroup, 0);
         cgroup_free(&sandbox_cgroup);
     }
 
@@ -141,7 +139,7 @@ void init_dirs() {
     std::array<std::string, 5> dirs = {"dev", "etc", "proc", "root", "tmp"};
 
     bs::error_code ec;
-    for (auto &dir:dirs) {
+    for (auto &dir: dirs) {
         fs::create_directories(sandbox / dir, ec);
         if (ec.value() != bs::errc::success)
             fatal("cannot create system dir: " + ec.message());
@@ -200,14 +198,15 @@ void create_hardlink(const fs::path &src, const fs::path &dst) {
             return;
 
         if (ec == bs::errc::cross_device_link) {
-            fs::copy_file(real_path, dst, ec);
+            fs::create_symlink(real_path, dst, ec);
             if (ec != bs::errc::success) {
-                fatal("cannot copy cross-device file: " + ec.message());
+                fatal("cannot create symlink " + real_path.string() + "->" + dst.string() + ": " +
+                      ec.message());
             }
             return;
         }
 
-        fatal("cannot create hardlink: " + ec.message());
+        fatal("cannot create hardlink " + real_path.string() + "->" + dst.string() + ": " + ec.message());
     }
 }
 
@@ -220,7 +219,7 @@ void add_file(const fs::path &src, const fs::path &dst, bool with_deps) {
         std::vector<std::string> libs;
         libs_deps(sbox_path, libs);
 
-        for (auto &l:libs) {
+        for (auto &l: libs) {
             create_hardlink(l, sandbox / l);
         }
     }
@@ -245,29 +244,31 @@ cgroup *create_cgroup(const std::string &name, const std::string &cpu_set, uint6
 
     auto cgroup = cgroup_new_cgroup(name.c_str());
 
+    auto cpu_ctrl = cgroup_add_controller(cgroup, "cpu");
+    if (!cpu_ctrl) {
+        fatal_cgroup("cannot cpu controller");
+    }
+
     if (!cpu_set.empty()) {
-        auto cpuset_ctrl = cgroup_add_controller(cgroup, "cpuset");
-        if (cgroup_set_value_string(cpuset_ctrl, "cpuset.cpus", cpu_set.c_str()))
+        if (cgroup_set_value_string(cpu_ctrl, "cpuset.cpus", cpu_set.c_str()))
             fatal_cgroup("cannot set cpuset.cpus");
 
-        if (cgroup_set_value_string(cpuset_ctrl, "cpuset.cpus", cpu_set.c_str()))
-            fatal_cgroup("cannot set cpuset.cpus");
-
-        if (cgroup_set_value_string(cpuset_ctrl, "cpuset.mems", "0"))
+        if (cgroup_set_value_string(cpu_ctrl, "cpuset.mems", "0"))
             fatal_cgroup("cannot set cpuset.mems");
     }
 
     if (mem_limit) {
         auto mem_ctrl = cgroup_add_controller(cgroup, "memory");
 
-        if (cgroup_set_value_uint64(mem_ctrl, "memory.limit_in_bytes", mem_limit))
+        if (cgroup_set_value_uint64(mem_ctrl, "memory.max", mem_limit))
             fatal_cgroup("cannot set memory limit");
     }
 
-    cgroup_add_controller(cgroup, "cpuacct");
-    cgroup_add_controller(cgroup, "blkio");
+    if (!cgroup_add_controller(cgroup, "io")) {
+        fatal_cgroup("cannot io controller");
+    }
 
-    if (cgroup_create_cgroup(cgroup, 0))
+    if (cgroup_create_cgroup(cgroup, 0) == ECGROUPNOTEQUAL)
         fatal_cgroup("cannot create cgroup");
 
     return cgroup;
@@ -307,24 +308,25 @@ void save_usage_stat(const std::string &filename, const std::string &cgroup_name
     if (!out.is_open())
         fatal_errno("cannot create file for usage statistic");
 
-    fs::ifstream cpu_usage_in(fs::path("/sys/fs/cgroup/cpuacct") / cgroup_name / "cpuacct.usage_all");
+    fs::ifstream cpu_usage_in(fs::path("/sys/fs/cgroup") / cgroup_name / "cpu.stat");
     if (cpu_usage_in.is_open()) {
-        std::string header;
-        cpu_usage_in >> header >> header >> header;
         uint64_t total_user = 0;
         uint64_t total_system = 0;
         while (cpu_usage_in) {
-            uint64_t cpu_id, user, system;
-            cpu_usage_in >> cpu_id >> user >> system;
-            total_user += user;
-            total_system += system;
+            std::string name;
+            uint64_t value;
+            cpu_usage_in >> name >> value;
+            if (name == "user_usec")
+                total_user = value;
+            else if (name == "system_usec")
+                total_system = value;
         }
 
         out << "cpu_user\t" << total_user << "\n";
         out << "cpu_system\t" << total_system << "\n";
     }
 
-    fs::ifstream memory_usage_in(fs::path("/sys/fs/cgroup/memory") / cgroup_name / "memory.usage_in_bytes");
+    fs::ifstream memory_usage_in(fs::path("/sys/fs/cgroup") / cgroup_name / "memory.current");
     if (memory_usage_in.is_open()) {
         uint64_t bytes = 0;
         memory_usage_in >> bytes;
