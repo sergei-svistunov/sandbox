@@ -1,24 +1,25 @@
 #include <iostream>
+#include <fstream>
 #include <array>
 #include <vector>
 #include <string>
 #include <regex>
 #include <cstdlib>
+#include <cstring>
 
+#include <filesystem>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <mntent.h>
-
-#include <boost/filesystem.hpp>
 #include <libcgroup.h>
+
 
 #define STACK_SIZE (1024 * 1024)
 #define NOBODY_UID 65534
 
-namespace fs = boost::filesystem;
-namespace bs = boost::system;
+namespace fs = std::filesystem;
 
 struct exe_opts {
     const fs::path &bin_path;
@@ -116,9 +117,9 @@ void remove_sandbox_path() {
     }
     endmntent(mounts_f);
 
-    bs::error_code ec;
-    fs::remove_all(sandbox, ec);
-    if (ec.value() != bs::errc::success)
+    std::error_code ec;
+    fs::remove_all(sandbox, ec) < 0;
+    if (ec)
         fatal("cannot remove sandbox: " + ec.message());
 }
 
@@ -138,10 +139,10 @@ void init_dirs() {
 
     std::array<std::string, 5> dirs = {"dev", "etc", "proc", "root", "tmp"};
 
-    bs::error_code ec;
+    std::error_code ec;
     for (auto &dir: dirs) {
         fs::create_directories(sandbox / dir, ec);
-        if (ec.value() != bs::errc::success)
+        if (ec)
             fatal("cannot create system dir: " + ec.message());
     }
 
@@ -174,12 +175,12 @@ void libs_deps(fs::path &bin, std::vector<std::string> &res) {
 }
 
 void create_hardlink(const fs::path &src, const fs::path &dst) {
-    bs::error_code ec;
+    std::error_code ec;
 
     fs::path real_path = src;
     if (fs::is_symlink(src)) {
         auto target = fs::read_symlink(src, ec);
-        if (ec.value() != bs::errc::success)
+        if (ec)
             fatal("cannot read symlink shared link: " + ec.message());
 
         if (target.has_root_path())
@@ -189,20 +190,19 @@ void create_hardlink(const fs::path &src, const fs::path &dst) {
     }
 
     fs::create_directories(dst.parent_path(), ec);
-    if (ec.value() != bs::errc::success)
+    if (ec)
         fatal("cannot create directory for hard link: " + ec.message());
 
     fs::create_hard_link(real_path, dst, ec);
-    if (ec != bs::errc::success) {
-        if (ec == bs::errc::file_exists)
+    if (ec) {
+        if (ec == std::errc::file_exists)
             return;
 
-        if (ec == bs::errc::cross_device_link) {
-            fs::create_symlink(real_path, dst, ec);
-            if (ec != bs::errc::success) {
-                fatal("cannot create symlink " + real_path.string() + "->" + dst.string() + ": " +
-                      ec.message());
-            }
+        if (ec == std::errc::cross_device_link) {
+            ec.clear();
+            fs::copy_file(real_path, dst, ec);
+            if (ec)
+                fatal("cannot copy file " + real_path.string() + "->" + dst.string() + ": " + ec.message());
             return;
         }
 
@@ -211,7 +211,7 @@ void create_hardlink(const fs::path &src, const fs::path &dst) {
 }
 
 void add_file(const fs::path &src, const fs::path &dst, bool with_deps) {
-    auto sbox_path = sandbox / dst;
+    auto sbox_path = sandbox / dst.relative_path();
 
     create_hardlink(src, sbox_path);
 
@@ -220,17 +220,17 @@ void add_file(const fs::path &src, const fs::path &dst, bool with_deps) {
         libs_deps(sbox_path, libs);
 
         for (auto &l: libs) {
-            create_hardlink(l, sandbox / l);
+            create_hardlink(l, sandbox / fs::path(l).relative_path());
         }
     }
 }
 
 void mount_dir(const fs::path &src, const fs::path &dst) {
-    auto sbox_path = sandbox / dst;
+    auto sbox_path = sandbox / dst.relative_path();;
 
-    bs::error_code ec;
+    std::error_code ec;
     fs::create_directories(sbox_path, ec);
-    if (ec.value() != bs::errc::success)
+    if (ec)
         fatal("cannot create target mount directory: " + ec.message());
 
     if (mount(src.c_str(), sbox_path.c_str(), "", MS_BIND, nullptr))
@@ -304,11 +304,11 @@ static int _execute(void *arg) {
 }
 
 void save_usage_stat(const std::string &filename, const std::string &cgroup_name) {
-    fs::ofstream out(filename);
+    std::ofstream out(filename);
     if (!out.is_open())
         fatal_errno("cannot create file for usage statistic");
 
-    fs::ifstream cpu_usage_in(fs::path("/sys/fs/cgroup") / cgroup_name / "cpu.stat");
+    std::ifstream cpu_usage_in(fs::path("/sys/fs/cgroup") / cgroup_name / "cpu.stat");
     if (cpu_usage_in.is_open()) {
         uint64_t total_user = 0;
         uint64_t total_system = 0;
@@ -326,7 +326,7 @@ void save_usage_stat(const std::string &filename, const std::string &cgroup_name
         out << "cpu_system\t" << total_system << "\n";
     }
 
-    fs::ifstream memory_usage_in(fs::path("/sys/fs/cgroup") / cgroup_name / "memory.current");
+    std::ifstream memory_usage_in(fs::path("/sys/fs/cgroup") / cgroup_name / "memory.current");
     if (memory_usage_in.is_open()) {
         uint64_t bytes = 0;
         memory_usage_in >> bytes;
