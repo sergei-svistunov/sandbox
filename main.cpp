@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <mntent.h>
 #include <libcgroup.h>
+#include <immintrin.h>
 
 
 #define STACK_SIZE (1024 * 1024)
@@ -25,6 +26,7 @@ struct exe_opts {
     const fs::path &bin_path;
     const std::vector<char *> &args;
     const std::vector<char *> &env;
+    const fs::path &exec_dir;
 };
 
 static pid_t pid;
@@ -47,32 +49,37 @@ void fatal_cgroup(const std::string &message) {
 }
 
 void path_pids(std::vector<int> &res) {
-    if (!fs::exists(sandbox)) { ;
+    if (!fs::exists(sandbox)) {
         return;
     }
 
     std::array<char, 256> buffer{};
-
     std::string out_buf;
-    auto lsof_cmd = std::string("/usr/bin/lsof -n -w -Fp +d ") + sandbox.string();
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(lsof_cmd.c_str(), "r"), pclose);
+
+    const std::string lsof_cmd =
+        "/usr/bin/lsof -n -w -Fp +d " + sandbox.string();
+
+    using Pipe = std::unique_ptr<FILE, int (*)(FILE *)>;
+    Pipe pipe(popen(lsof_cmd.c_str(), "r"), pclose);
     if (!pipe) {
         fatal("cannot get path pids");
     }
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        out_buf += buffer.data();
+
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe.get()) != nullptr) {
+        out_buf.append(buffer.data());
     }
 
-    std::regex e(R"(p([\d]+))");
-    std::smatch m;
+    static const std::regex re(R"(p([0-9]+))");
 
-    while (std::regex_search(out_buf, m, e)) {
-        if (m.length() < 2)
+    for (std::sregex_iterator it(out_buf.begin(), out_buf.end(), re), end;
+         it != end; ++it) {
+        const std::smatch &m = *it;
+        if (m.size() < 2) {
             continue;
+        }
 
-        res.push_back(std::strtol(m[1].first.base(), nullptr, 10));
-
-        out_buf = m.suffix().str();
+        int pid = std::stoi(m.str(1));
+        res.push_back(pid);
     }
 }
 
@@ -152,25 +159,29 @@ void init_dirs() {
 
 void libs_deps(fs::path &bin, std::vector<std::string> &res) {
     std::array<char, 256> buffer{};
-
     std::string out_buf;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(
-            (std::string("/usr/bin/ldd ") + bin.string()).c_str(), "r"), pclose);
+
+    const std::string cmd = "/usr/bin/ldd " + bin.string();
+
+    using Pipe = std::unique_ptr<FILE, int (*)(FILE *)>;
+    Pipe pipe(popen(cmd.c_str(), "r"), pclose);
     if (!pipe) {
         fatal("cannot get libraries dependencies");
     }
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        out_buf += buffer.data();
+
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe.get()) != nullptr) {
+        out_buf.append(buffer.data());
     }
 
-    std::regex e(R"((?:.+?\s+=>)?\s+(/.+?)\s+\(.+?\))");
-    std::smatch m;
+    static const std::regex re(R"((?:.+?\s+=>)?\s+(/.+?)\s+\(.+?\))");
 
-    while (std::regex_search(out_buf, m, e)) {
-        if (m.length() < 2)
+    for (std::sregex_iterator it(out_buf.begin(), out_buf.end(), re), end;
+         it != end; ++it) {
+        const std::smatch &m = *it;
+        if (m.size() < 2) {
             continue;
-        res.push_back(m[1]);
-        out_buf = m.suffix().str();
+        }
+        res.push_back(m.str(1));
     }
 }
 
@@ -288,7 +299,7 @@ static int _execute(void *arg) {
         if (errno != EBUSY)
             fatal_errno("cannot mount /proc");
 
-    if (chdir("/root"))
+    if (chdir(opts->exec_dir.empty() ? "/root": opts->exec_dir.c_str()))
         fatal_errno("cannot chdir");
 
     if (setgid(NOBODY_UID))
@@ -336,12 +347,12 @@ void save_usage_stat(const std::string &filename, const std::string &cgroup_name
 
 int execute(const fs::path &bin, const std::vector<char *> &args, const std::vector<char *> &env, const int flags,
             const std::string &cgroup_name, const std::string &cpu_set, const uint64_t mem_limit,
-            const std::string &usage_stat_file) {
+            const std::string &usage_stat_file, const fs::path &exec_dir) {
 
     if (mem_limit && cgroup_name.empty())
         fatal("cannot set memory limit without cgroup name");
 
-    exe_opts opts{bin, args, env};
+    exe_opts opts{bin, args, env, exec_dir};
 
     if (!cgroup_name.empty()) {
         sandbox_cgroup = create_cgroup(cgroup_name, cpu_set, mem_limit);
@@ -401,6 +412,9 @@ args:
 
     --save_usage_stat <filename>
         Save usage statistic to file after exit
+
+    --exec_dir <path>
+        The directory inside a sandbox where the command will be executed
 )" << std::endl;
 
     exit(EXIT_FAILURE);
@@ -433,7 +447,7 @@ int main(int argc, char *argv[]) {
     if (!fopen(sandbox.c_str(), "r"))
         fatal_errno("cannot open sandbox path");
 
-    fs::path cmd;
+    fs::path cmd, exec_dir;
     std::string cgroup, cpu_set, usage_stat_file;
     uint64_t mem_limit = 0;
     std::vector<char *> cmd_args = {nullptr}; // reserved for cmd path
@@ -512,6 +526,14 @@ int main(int argc, char *argv[]) {
 
             i += 2;
 
+        } else if (strcmp(argv[i], "--exec_dir") == 0) {
+            if (i + 2 > argc || strncmp(argv[i + 1], "--", 2) == 0)
+                print_usage();
+
+            exec_dir = argv[i + 1];
+
+            i += 2;
+
         } else {
             print_usage();
         }
@@ -528,5 +550,5 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
-    return execute(cmd, cmd_args, cmd_env, flags, cgroup, cpu_set, mem_limit, usage_stat_file);
+    return execute(cmd, cmd_args, cmd_env, flags, cgroup, cpu_set, mem_limit, usage_stat_file, exec_dir);
 }
